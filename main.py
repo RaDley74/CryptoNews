@@ -1,4 +1,3 @@
-
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
@@ -130,13 +129,12 @@ def get_page_text(url):
 def clean_html_for_telegram(text):
     if not text: return ""
     
-    # 1. Удаляем технические заголовки, если нейросеть их написала
+    # 1. Удаляем технические заголовки
     bad_prefixes = [
         "Тело поста:", "Вступление:", "Заголовок:", "Заключение:", 
         "Body:", "Intro:", "Title:", "Conclusion:", "Структура поста:",
         "Детали:", "Реакция рынка:", "Что будет дальше:", "Мнение Pulse Flow:"
     ]
-    # Удаляем эти слова, если они стоят в начале строки или абзаца
     for prefix in bad_prefixes:
         text = re.sub(fr'{prefix}\s*', '', text, flags=re.IGNORECASE)
 
@@ -159,7 +157,6 @@ def smart_truncate(text, max_length=4000):
     else:
         truncated = truncated.rsplit(' ', 1)[0]
     
-    # Закрываем теги, если обрезали посередине (простая проверка)
     if truncated.count('<b>') > truncated.count('</b>'):
         truncated += '</b>'
     
@@ -172,7 +169,7 @@ def process_content_dynamic(text):
     
     logger.info(f"Анализирую новость ({MODEL_NAME})...")
     
-    # АДАПТИВНЫЙ ПРОМПТ
+    # ОБНОВЛЕННЫЙ ПРОМПТ: ЗАПРЕТ НА ТЕКСТ В КАРТИНКАХ
     system_prompt = """
     Ты — главный редактор Telegram-канала "Pulse Flow Crypto".
     
@@ -182,21 +179,22 @@ def process_content_dynamic(text):
     1. 🟢 Локальная новость: 800 - 1200 символов (Кратко и по делу).
     2. 🔴 Глобальное событие: 2000 - 3500 символов (Глубокая аналитика).
     
-    СТРУКТУРА ПОСТА (САМИ НАЗВАНИЯ БЛОКОВ ТИПА "ВСТУПЛЕНИЕ" НЕ ПИСАТЬ!):
-    
+    СТРУКТУРА ПОСТА:
     1. [Заголовок]: ⚡️ ЗАГОЛОВОК (Цепляющий, с эмодзи).
-       
-    2. [Текст]: Сначала суть в 1-2 предложениях. Затем подробности и факты. Раскрывай тему плавно, без разрывов. Используй абзацы.
-       
-    3. [Вывод]: 👁 Мнение Crypto Pulse (Твой авторский вывод).
+    2. [Текст]: Суть + подробности.
+    3. [Вывод]: 👁 Мнение Crypto Pulse.
     
-    ТРЕБОВАНИЯ:
-    - НИКОГДА не пиши слова: "Вступление", "Тело поста", "Заключение".
-    - Используй HTML теги: <b>жирный</b> (для имен, монет, цифр), <code>код</code>.
-    - Всегда пиши тикеры через $ (например $TON, $BTC).
+    ТРЕБОВАНИЯ К ПОСТУ:
+    - HTML теги: <b>жирный</b>, <code>код</code>.
+    - Тикеры через $ (например $BTC).
     
     В КОНЦЕ ОТВЕТА РАЗДЕЛИТЕЛЬ: |||
-    После него: 1 промпт для картинки (English, 3d render, crypto style).
+    После него напиши 1 ПРОМПТ ДЛЯ КАРТИНКИ на английском.
+    
+    ВАЖНО ДЛЯ КАРТИНКИ:
+    - Придумай ВИЗУАЛЬНУЮ МЕТАФОРУ (например: "золотой бык", "цифровой замок", "ракета в неоне").
+    - СТРОГО ЗАПРЕЩЕНО использовать слова: "text", "graph", "chart", "diagram", "letters", "percent".
+    - Описывай ТОЛЬКО объект или атмосферу. Не проси нарисовать надписи.
     """
 
     safe_text = str(text)
@@ -222,7 +220,7 @@ def process_content_dynamic(text):
                 image_prompt = parts[1].strip()
             else:
                 post_text = clean_html_for_telegram(full_response)
-                image_prompt = "Futuristic crypto concept, 3d render"
+                image_prompt = "Abstract futuristic crypto sphere, neon lights, 3d render"
 
             prompts = [image_prompt] if image_prompt else []
             if not prompts: prompts.append("Abstract blockchain background, blue neon, 3d render")
@@ -247,12 +245,18 @@ def process_content_dynamic(text):
 def generate_image_urls(prompts):
     urls = []
     base_seed = int(time.time())
+    
+    # Жесткий стиль: запрещает текст, цифры и графики, делает красивое 3D
+    forced_style = "futuristic 3d crypto art, isometric, unreal engine 5 render, cinematic lighting, no text, no numbers, no typography, no graphs, high detail, 8k, abstract masterpiece"
+
     for i, prompt in enumerate(prompts):
-        style = "abstract 3d render, cinematic lighting, depth of field, no text, 8k resolution"
         clean_prompt = re.sub(r'[^\w\s,]', '', prompt) 
-        full_prompt = urllib.parse.quote(f"{clean_prompt}, {style}")
+        
+        # Склеиваем промпт от AI + наш жесткий стиль
+        full_prompt = urllib.parse.quote(f"{clean_prompt}, {forced_style}")
+        
         seed = base_seed + i 
-        # Pollinations генерирует ссылку мгновенно, она работает как API
+        # Используем модель Flux (она лучше других слушается команды "no text")
         url = f"https://image.pollinations.ai/prompt/{full_prompt}?width=1280&height=720&seed={seed}&nologo=true&model=flux"
         urls.append(url)
     return urls
@@ -261,10 +265,9 @@ def generate_image_urls(prompts):
 def send_telegram(text, image_urls):
     api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     
-    # ТРЮК: Скрытая ссылка на картинку (Zero-width space link)
-    # Позволяет отправить текст до 4096 символов + картинка в превью
     if image_urls:
         img_url = image_urls[0]
+        # Скрытая ссылка на картинку для превью
         final_text = f'<a href="{img_url}">&#8205;</a>{text}'
     else:
         final_text = text
@@ -273,7 +276,7 @@ def send_telegram(text, image_urls):
         'chat_id': TELEGRAM_CHANNEL_ID,
         'text': final_text,
         'parse_mode': 'HTML',
-        'disable_web_page_preview': False # Важно: превью должно быть включено!
+        'disable_web_page_preview': False 
     }
 
     try:
@@ -281,7 +284,6 @@ def send_telegram(text, image_urls):
         
         if r.status_code == 400:
             logger.warning(f"Ошибка TG (HTML): {r.text}. Шлю чистый текст...")
-            # Если HTML сломался, шлем текст без форматирования, а ссылку в конец
             clean_text = BeautifulSoup(text, "html.parser").get_text()
             if image_urls:
                 clean_text += f"\n\n🖼 <a href='{image_urls[0]}'>Image</a>"
