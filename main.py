@@ -125,11 +125,11 @@ def get_page_text(url):
         return None
     except: return None
 
-# ================= ЧИСТКА ТЕКСТА =================
+# ================= ЧИСТКА ТЕКСТА (ИСПРАВЛЕННАЯ) =================
 def clean_html_for_telegram(text):
     if not text: return ""
     
-    # 1. Удаляем технические заголовки
+    # 0. Убираем "мусорные" заголовки от AI
     bad_prefixes = [
         "Тело поста:", "Вступление:", "Заголовок:", "Заключение:", 
         "Body:", "Intro:", "Title:", "Conclusion:", "Структура поста:",
@@ -138,13 +138,29 @@ def clean_html_for_telegram(text):
     for prefix in bad_prefixes:
         text = re.sub(fr'{prefix}\s*', '', text, flags=re.IGNORECASE)
 
-    # 2. Форматирование
-    text = text.replace("<br>", "\n").replace("<br/>", "\n")
-    text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text) # Markdown bold -> HTML bold
-    text = re.sub(r'</?(div|p|span|h\d|ul|li)[^>]*>', '', text) # Убираем лишние теги
-    
-    # 3. Чистка пустот
+    # 1. Заменяем структурные теги на переносы строк (ВАЖНО!)
+    # <br> -> перенос
+    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
+    # </p>, </div> -> двойной перенос (новый абзац)
+    text = re.sub(r'</(p|div|h\d)>', '\n\n', text, flags=re.IGNORECASE)
+    # </li> -> перенос
+    text = re.sub(r'</li>', '\n', text, flags=re.IGNORECASE)
+
+    # 2. Markdown -> HTML
+    text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text) # Жирный
+    text = re.sub(r'#{1,6}\s+(.*)', r'<b>\1</b>', text) # Markdown заголовки в жирный
+
+    # 3. Чистим оставшиеся HTML теги (удаляем сами теги, но оставляем текст внутри)
+    # Удаляем всё кроме разрешенных Telegram тегов (b, i, code, a, pre)
+    # Но проще удалить структурные, так как мы их уже заменили на \n
+    text = re.sub(r'</?(div|p|span|h\d|ul|ol|li|article|section)[^>]*>', '', text, flags=re.IGNORECASE)
+
+    # 4. Финальная шлифовка
+    # Убираем пробелы в начале/конце каждой строки
+    text = re.sub(r'^[ \t]+|[ \t]+$', '', text, flags=re.MULTILINE)
+    # Заменяем тройные+ переносы на двойные (чтобы не было огромных дыр)
     text = re.sub(r'\n{3,}', '\n\n', text)
+
     return text.strip()
 
 def smart_truncate(text, max_length=4000):
@@ -169,7 +185,7 @@ def process_content_dynamic(text):
     
     logger.info(f"Анализирую новость ({MODEL_NAME})...")
     
-    # ОБНОВЛЕННЫЙ ПРОМПТ: ЗАПРЕТ НА ТЕКСТ В КАРТИНКАХ
+    # ОБНОВЛЕННЫЙ ПРОМПТ
     system_prompt = """
     Ты — главный редактор Telegram-канала "Pulse Flow Crypto".
     
@@ -184,7 +200,8 @@ def process_content_dynamic(text):
     2. [Текст]: Суть + подробности.
     3. [Вывод]: 👁 Мнение Crypto Pulse.
     
-    ТРЕБОВАНИЯ К ПОСТУ:
+    ТРЕБОВАНИЯ:
+    - Используй АБЗАЦЫ (отделяй пустой строкой).
     - HTML теги: <b>жирный</b>, <code>код</code>.
     - Тикеры через $ (например $BTC).
     
@@ -251,12 +268,9 @@ def generate_image_urls(prompts):
 
     for i, prompt in enumerate(prompts):
         clean_prompt = re.sub(r'[^\w\s,]', '', prompt) 
-        
-        # Склеиваем промпт от AI + наш жесткий стиль
         full_prompt = urllib.parse.quote(f"{clean_prompt}, {forced_style}")
         
         seed = base_seed + i 
-        # Используем модель Flux (она лучше других слушается команды "no text")
         url = f"https://image.pollinations.ai/prompt/{full_prompt}?width=1280&height=720&seed={seed}&nologo=true&model=flux"
         urls.append(url)
     return urls
@@ -267,7 +281,6 @@ def send_telegram(text, image_urls):
     
     if image_urls:
         img_url = image_urls[0]
-        # Скрытая ссылка на картинку для превью
         final_text = f'<a href="{img_url}">&#8205;</a>{text}'
     else:
         final_text = text
