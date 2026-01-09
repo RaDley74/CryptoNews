@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import os
+import random
 from dotenv import load_dotenv
 
 # !!! ЛЕЧЕНИЕ КОДИРОВКИ WINDOWS (ОБЯЗАТЕЛЬНО В НАЧАЛЕ) !!!
@@ -25,10 +26,8 @@ from groq import Groq
 load_dotenv()
 
 # ================= НАСТРОЙКИ =================
-# Пауза между постами (3 минуты).
 DELAY_BETWEEN_POSTS = int(os.getenv("DELAY_BETWEEN_POSTS", 180))
 
-# ВСТАВЬ СЮДА СВОИ КЛЮЧИ
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
@@ -47,7 +46,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Инициализация клиента Groq
+# Инициализация Groq
 try:
     client = Groq(api_key=GROQ_API_KEY)
 except Exception as e:
@@ -125,11 +124,11 @@ def get_page_text(url):
         return None
     except: return None
 
-# ================= ЧИСТКА ТЕКСТА (ИСПРАВЛЕННАЯ) =================
+# ================= ЧИСТКА ТЕКСТА (ИСПРАВЛЕННАЯ СТРУКТУРА) =================
 def clean_html_for_telegram(text):
     if not text: return ""
     
-    # 0. Убираем "мусорные" заголовки от AI
+    # 0. Удаляем мусорные заголовки от AI
     bad_prefixes = [
         "Тело поста:", "Вступление:", "Заголовок:", "Заключение:", 
         "Body:", "Intro:", "Title:", "Conclusion:", "Структура поста:",
@@ -138,27 +137,38 @@ def clean_html_for_telegram(text):
     for prefix in bad_prefixes:
         text = re.sub(fr'{prefix}\s*', '', text, flags=re.IGNORECASE)
 
-    # 1. Заменяем структурные теги на переносы строк (ВАЖНО!)
-    # <br> -> перенос
+    # 1. Сначала обрабатываем Markdown жирный шрифт **текст** -> <b>текст</b>
+    text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
+    
+    # 2. ГЛАВНОЕ: Превращаем теги абзацев в двойные переносы строк
+    # <br> -> один перенос
     text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
-    # </p>, </div> -> двойной перенос (новый абзац)
+    # </p> или </div> -> ДВА переноса (чтобы была пустая строка)
     text = re.sub(r'</(p|div|h\d)>', '\n\n', text, flags=re.IGNORECASE)
-    # </li> -> перенос
+    # </li> -> один перенос
     text = re.sub(r'</li>', '\n', text, flags=re.IGNORECASE)
 
-    # 2. Markdown -> HTML
-    text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text) # Жирный
-    text = re.sub(r'#{1,6}\s+(.*)', r'<b>\1</b>', text) # Markdown заголовки в жирный
+    # 3. Удаляем все открывающие теги блоков (они нам не нужны, мы уже обработали закрывающие)
+    text = re.sub(r'<p[^>]*>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'<div[^>]*>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'<h\d[^>]*>', '', text, flags=re.IGNORECASE)
 
-    # 3. Чистим оставшиеся HTML теги (удаляем сами теги, но оставляем текст внутри)
-    # Удаляем всё кроме разрешенных Telegram тегов (b, i, code, a, pre)
-    # Но проще удалить структурные, так как мы их уже заменили на \n
-    text = re.sub(r'</?(div|p|span|h\d|ul|ol|li|article|section)[^>]*>', '', text, flags=re.IGNORECASE)
+    # 4. Списки: делаем красиво
+    text = re.sub(r'<li[^>]*>', '• ', text, flags=re.IGNORECASE)
+    text = re.sub(r'<ul[^>]*>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'</ul[^>]*>', '\n', text, flags=re.IGNORECASE)
 
-    # 4. Финальная шлифовка
-    # Убираем пробелы в начале/конце каждой строки
-    text = re.sub(r'^[ \t]+|[ \t]+$', '', text, flags=re.MULTILINE)
-    # Заменяем тройные+ переносы на двойные (чтобы не было огромных дыр)
+    # 5. Чистим всё остальное (кроме поддерживаемых Telegram тегов: b, strong, i, em, code, pre, a)
+    # Удаляем все теги, кроме разрешенных. 
+    # В данном случае проще удалить всё, что похоже на тег и не является <b>, <a>, <code> и т.д.
+    # Но регулярка выше уже сделала основную работу по структуре.
+    
+    # 6. Финальная зачистка пробелов и лишних переносов
+    # Удаляем пробелы в начале и конце строк
+    lines = [line.strip() for line in text.split('\n')]
+    text = '\n'.join(lines)
+    
+    # Заменяем 3 и более переносов на 2 (чтобы не было огромных дыр)
     text = re.sub(r'\n{3,}', '\n\n', text)
 
     return text.strip()
@@ -185,33 +195,37 @@ def process_content_dynamic(text):
     
     logger.info(f"Анализирую новость ({MODEL_NAME})...")
     
-    # ОБНОВЛЕННЫЙ ПРОМПТ
+    # !!! ПРОМПТ С ЖЕСТКИМ ТРЕБОВАНИЕМ HTML ТЕГОВ !!!
     system_prompt = """
-    Ты — главный редактор Telegram-канала "Pulse Flow Crypto".
+    Ты — редактор крипто-канала "Pulse Flow".
     
-    Твоя задача: Написать пост на русском языке, АДАПТИРУЯ ЕГО ОБЪЕМ под важность события.
+    Твоя задача:
+    1. Написать пост на русском.
+    2. Придумать описание картинки на английском, которая ИЛЛЮСТРИРУЕТ ЭТУ НОВОСТЬ.
     
-    ЛОГИКА ОБЪЕМА:
-    1. 🟢 Локальная новость: 800 - 1200 символов (Кратко и по делу).
-    2. 🔴 Глобальное событие: 2000 - 3500 символов (Глубокая аналитика).
+    ФОРМАТИРОВАНИЕ (СТРОГО):
+    - Каждый абзац ОБЯЗАТЕЛЬНО оборачивай в тег <p>Текст абзаца</p>.
+    - Заголовки выделяй <b>жирным</b> (не используй #).
+    - Для важных слов используй <b>жирный</b>.
+    - Тикеры пиши через $ (например $BTC).
     
     СТРУКТУРА ПОСТА:
-    1. [Заголовок]: ⚡️ ЗАГОЛОВОК (Цепляющий, с эмодзи).
-    2. [Текст]: Суть + подробности.
-    3. [Вывод]: 👁 Мнение Crypto Pulse.
-    
-    ТРЕБОВАНИЯ:
-    - Используй АБЗАЦЫ (отделяй пустой строкой).
-    - HTML теги: <b>жирный</b>, <code>код</code>.
-    - Тикеры через $ (например $BTC).
+    <p>⚡️ <b>ЗАГОЛОВОК</b></p>
+    <p>Текст новости (суть).</p>
+    <p>Детали и цифры.</p>
+    <p>👁 <b>Вывод</b>: Мнение Pulse Flow.</p>
     
     В КОНЦЕ ОТВЕТА РАЗДЕЛИТЕЛЬ: |||
-    После него напиши 1 ПРОМПТ ДЛЯ КАРТИНКИ на английском.
+    После него напиши ПРОМПТ ДЛЯ КАРТИНКИ (на английском).
     
-    ВАЖНО ДЛЯ КАРТИНКИ:
-    - Придумай ВИЗУАЛЬНУЮ МЕТАФОРУ (например: "золотой бык", "цифровой замок", "ракета в неоне").
-    - СТРОГО ЗАПРЕЩЕНО использовать слова: "text", "graph", "chart", "diagram", "letters", "percent".
-    - Описывай ТОЛЬКО объект или атмосферу. Не проси нарисовать надписи.
+    ИНСТРУКЦИЯ ДЛЯ КАРТИНКИ:
+    - Картинка должна содержать ГЛАВНЫЙ ОБЪЕКТ новости.
+    - Если новость про Bitcoin -> пиши "Bitcoin logo visual representation".
+    - Если про Ethereum -> "Ethereum logo crystal".
+    - Если про взлом -> "Hooded hacker, digital glitch, red binary code".
+    - Если про рост -> "Green arrow, golden bull, rocket launch".
+    - Если про падение -> "Red storm, angry bear, cracked ground".
+    - НЕ ПИШИ стиль (render, 4k, realistic) - бот добавит сам.
     """
 
     safe_text = str(text)
@@ -237,10 +251,10 @@ def process_content_dynamic(text):
                 image_prompt = parts[1].strip()
             else:
                 post_text = clean_html_for_telegram(full_response)
-                image_prompt = "Abstract futuristic crypto sphere, neon lights, 3d render"
+                image_prompt = "Crypto blockchain node technology"
 
             prompts = [image_prompt] if image_prompt else []
-            if not prompts: prompts.append("Abstract blockchain background, blue neon, 3d render")
+            if not prompts: prompts.append("Bitcoin futuristic concept")
             
             post_text = smart_truncate(post_text, max_length=4000)
             return post_text, prompts
@@ -258,21 +272,39 @@ def process_content_dynamic(text):
                 
     return None, []
 
-# ================= ЗАГРУЗКА ФОТО (Pollinations) =================
+# ================= ЗАГРУЗКА ФОТО (СМЫСЛ + СТИЛЬ) =================
 def generate_image_urls(prompts):
     urls = []
     base_seed = int(time.time())
     
-    # Жесткий стиль: запрещает текст, цифры и графики, делает красивое 3D
-    forced_style = "futuristic 3d crypto art, isometric, unreal engine 5 render, cinematic lighting, no text, no numbers, no typography, no graphs, high detail, 8k, abstract masterpiece"
+    art_styles = [
+        "cyberpunk city style, neon lights",
+        "futuristic 3d render, unreal engine 5, isometric",
+        "digital art, synthesizerwave colors",
+        "cinematic lighting, dark noir atmosphere",
+        "oil painting style, artistic masterpiece",
+        "blueprint technical drawing style",
+        "low poly 3d art, vibrant colors",
+        "surreal dreamlike atmosphere"
+    ]
+
+    quality_filters = "high detail, 8k, no text, no typography"
 
     for i, prompt in enumerate(prompts):
-        clean_prompt = re.sub(r'[^\w\s,]', '', prompt) 
-        full_prompt = urllib.parse.quote(f"{clean_prompt}, {forced_style}")
+        clean_prompt = re.sub(r'[^\w\s,]', '', prompt)
+        
+        chosen_style = random.choice(art_styles)
+        
+        # Сначала ЧТО, потом КАК
+        final_query = f"{clean_prompt}, {chosen_style}, {quality_filters}"
+        full_prompt = urllib.parse.quote(final_query)
         
         seed = base_seed + i 
         url = f"https://image.pollinations.ai/prompt/{full_prompt}?width=1280&height=720&seed={seed}&nologo=true&model=flux"
         urls.append(url)
+        
+        logger.info(f"🎨 Запрос картинки: {clean_prompt} | Стиль: {chosen_style}")
+        
     return urls
 
 # ================= ОТПРАВКА =================
@@ -297,7 +329,8 @@ def send_telegram(text, image_urls):
         
         if r.status_code == 400:
             logger.warning(f"Ошибка TG (HTML): {r.text}. Шлю чистый текст...")
-            clean_text = BeautifulSoup(text, "html.parser").get_text()
+            # Попытка спасти текст, убрав теги, но оставив абзацы
+            clean_text = text.replace('<b>', '').replace('</b>', '').replace('<code>', '').replace('</code>', '')
             if image_urls:
                 clean_text += f"\n\n🖼 <a href='{image_urls[0]}'>Image</a>"
             
