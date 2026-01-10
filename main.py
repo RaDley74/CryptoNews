@@ -224,10 +224,6 @@ def process_content_dynamic(text):
     ИНСТРУКЦИЯ ДЛЯ КАРТИНКИ:
     - Картинка должна быть УНИКАЛЬНОЙ и СТРОГО ПО ТЕМЕ НОВОСТИ.
     - ИЗБЕГАЙ ПРОСТЫХ ЛОГОТИПОВ. Используй метафоры и действия.
-    - Если новость про суд/регуляцию -> "Court hammer hitting blockchain, legal documents, dramatic lighting".
-    - Если про взлом -> "Hacker silhouette, digital glitch, red binary code rain, security breach".
-    - Если про рост рынка -> "Golden bull charging, green financial charts rising, futuristic city growth".
-    - Если про технологии -> "Abstract blockchain nodes connecting, glowing neural network, futuristic interface".
     - Опиши объекты, действие и настроение сцены.
     - НЕ ПИШИ стиль (render, 4k, realistic) - бот добавит сам.
     """
