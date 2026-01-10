@@ -137,6 +137,9 @@ def clean_html_for_telegram(text):
     for prefix in bad_prefixes:
         text = re.sub(fr'{prefix}\s*', '', text, flags=re.IGNORECASE)
 
+    # Удаляем китайские иероглифы (артефакты модели Llama)
+    text = re.sub(r'[\u4e00-\u9fff]+', '', text)
+
     # 1. Сначала обрабатываем Markdown жирный шрифт **текст** -> <b>текст</b>
     text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
     
@@ -201,7 +204,8 @@ def process_content_dynamic(text):
     
     Твоя задача:
     1. Написать пост на русском.
-    2. Придумать описание картинки на английском, которая ИЛЛЮСТРИРУЕТ ЭТУ НОВОСТЬ.
+    2. НЕ использовать китайские иероглифы (строгий запрет).
+    3. Придумать описание картинки на английском, которая ИЛЛЮСТРИРУЕТ ЭТУ НОВОСТЬ.
     
     ФОРМАТИРОВАНИЕ (СТРОГО):
     - Каждый абзац ОБЯЗАТЕЛЬНО оборачивай в тег <p>Текст абзаца</p>.
@@ -218,12 +222,13 @@ def process_content_dynamic(text):
     После него напиши ПРОМПТ ДЛЯ КАРТИНКИ (на английском).
     
     ИНСТРУКЦИЯ ДЛЯ КАРТИНКИ:
-    - Картинка должна содержать ГЛАВНЫЙ ОБЪЕКТ новости.
-    - Если новость про Bitcoin -> пиши "Bitcoin logo visual representation".
-    - Если про Ethereum -> "Ethereum logo crystal".
-    - Если про взлом -> "Hooded hacker, digital glitch, red binary code".
-    - Если про рост -> "Green arrow, golden bull, rocket launch".
-    - Если про падение -> "Red storm, angry bear, cracked ground".
+    - Картинка должна быть УНИКАЛЬНОЙ и СТРОГО ПО ТЕМЕ НОВОСТИ.
+    - ИЗБЕГАЙ ПРОСТЫХ ЛОГОТИПОВ. Используй метафоры и действия.
+    - Если новость про суд/регуляцию -> "Court hammer hitting blockchain, legal documents, dramatic lighting".
+    - Если про взлом -> "Hacker silhouette, digital glitch, red binary code rain, security breach".
+    - Если про рост рынка -> "Golden bull charging, green financial charts rising, futuristic city growth".
+    - Если про технологии -> "Abstract blockchain nodes connecting, glowing neural network, futuristic interface".
+    - Опиши объекты, действие и настроение сцены.
     - НЕ ПИШИ стиль (render, 4k, realistic) - бот добавит сам.
     """
 
@@ -284,7 +289,12 @@ def generate_image_urls(prompts):
         "oil painting style, artistic masterpiece",
         "blueprint technical drawing style",
         "low poly 3d art, vibrant colors",
-        "surreal dreamlike atmosphere"
+        "surreal dreamlike atmosphere",
+        "photorealistic, highly detailed, 8k",
+        "minimalist flat design, vector art",
+        "abstract data visualization, complex geometric shapes",
+        "retro comic book style, pop art",
+        "double exposure, artistic photography"
     ]
 
     quality_filters = "high detail, 8k, no text, no typography"
