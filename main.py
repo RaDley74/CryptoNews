@@ -146,7 +146,7 @@ def handle_consent_popup(driver):
         logger.warning(f"Ошибка куки: {e}")
 
 # ================= ПАРСИНГ =================
-def get_latest_news():
+def get_latest_news(only_fresh=True):
     driver = None
     links = [] 
     seen_urls = set()
@@ -186,15 +186,18 @@ def get_latest_news():
             except: continue
         
         top_20 = links[:20]
-        fresh_links = [link for link in top_20 if not is_posted(link)]
-        final_list = fresh_links[::-1]
         
-        if final_list:
-            logger.info(f"🔎 Готово к постингу: {len(final_list)} шт.")
+        if only_fresh:
+            fresh_links = [link for link in top_20 if not is_posted(link)]
+            final_list = fresh_links[::-1]
+            
+            if final_list:
+                logger.info(f"🔎 Готово к постингу: {len(final_list)} шт.")
+            else:
+                logger.warning("📭 Новых ссылок нет.")
+            return final_list
         else:
-            logger.warning("📭 Новых ссылок нет.")
-
-        return final_list
+            return top_20
 
     except Exception as e:
         logger.error(f"Selenium Error: {e}")
@@ -358,6 +361,36 @@ def send_telegram_post(text, image_url):
 # ================= MAIN =================
 if __name__ == "__main__":
     init_db()
+    
+    # --- ПЕРВИЧНАЯ СИНХРОНИЗАЦИЯ (ДЛЯ НОВОГО СЕРВЕРА) ---
+    try:
+        conn = sqlite3.connect('posted_news.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT count(*) FROM posts')
+        db_count = cursor.fetchone()[0]
+        conn.close()
+
+        if db_count == 0:
+            logger.info("🆕 Обнаружена пустая база. Выполняю первичную настройку...")
+            all_links = get_latest_news(only_fresh=False)
+            
+            if all_links:
+                logger.info(f"📥 Сохраняю {len(all_links)} ссылок в базу...")
+                for link in all_links:
+                    mark_as_posted(link)
+                
+                links_to_release = all_links[:5] # 5 самых свежих
+                logger.info(f"🔓 Освобождаю {len(links_to_release)} последних новостей для постинга...")
+                
+                conn = sqlite3.connect('posted_news.db')
+                for link in links_to_release:
+                    conn.execute('DELETE FROM posts WHERE url = ?', (link,))
+                conn.commit()
+                conn.close()
+                logger.info("✅ Синхронизация завершена.")
+    except Exception as e:
+        logger.error(f"Ошибка инициализации: {e}")
+
     mode_str = "🛠 ТЕСТОВЫЙ" if TEST_MODE else "📢 ПРОДАКШН"
     logger.info(f"🚀 Бот запущен. Режим: {mode_str}")
     
