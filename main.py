@@ -1,3 +1,5 @@
+# --- START OF FILE main.py ---
+
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
@@ -15,22 +17,14 @@ import random
 import hashlib
 from datetime import datetime
 from dotenv import load_dotenv
-from prompts import SYSTEM_PROMPT
+from bs4 import BeautifulSoup  # !!! НУЖНО: pip install beautifulsoup4 lxml !!!
 
-# --- SELENIUM IMPORTS ---
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
+from prompts import SYSTEM_PROMPT
+from groq import Groq 
 
 # !!! ЛЕЧЕНИЕ КОДИРОВКИ WINDOWS !!!
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
-
-from groq import Groq 
 
 try:
     load_dotenv()
@@ -55,11 +49,19 @@ TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID")
 TARGET_URL = "https://finance.yahoo.com/topic/crypto/"
 MODEL_NAME = os.getenv("MODEL_NAME", "llama-3.3-70b-versatile")
 
+# Хедеры для эмуляции браузера (чтобы Yahoo не блокировал)
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Cache-Control': 'max-age=0',
+    'Upgrade-Insecure-Requests': '1',
+}
+
 # === ЧЕРНЫЙ СПИСОК КАРТИНОК ===
-# Если бот снова пришлет ошибку, скопируй MD5 хэш из логов и добавь сюда.
 BLOCKED_IMAGE_HASHES = [
-    "d41d8cd98f00b204e9800998ecf8427e", # Пустой файл
-    # Сюда можно добавлять хэши заглушек "We Have Moved" если они пролезут через проверку размера
+    "d41d8cd98f00b204e9800998ecf8427e", 
+    "2090a5dc21c32952cbf8496339752bd1"
 ]
 
 # ================= ЛОГИРОВАНИЕ =================
@@ -116,116 +118,142 @@ def clean_html_for_telegram(text):
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
-# ================= SELENIUM =================
-def get_driver():
-    chrome_options = Options()
-    chrome_options.add_argument("--headless=new") 
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-    prefs = {"profile.managed_default_content_settings.images": 2}
-    chrome_options.add_experimental_option("prefs", prefs)
-    service = ChromeService(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=chrome_options)
-    return driver
+# ================= ПАРСИНГ (REQUESTS + BS4) =================
+def get_session():
+    """Создает сессию с базовыми куками, если нужно"""
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    return session
 
-def handle_consent_popup(driver):
-    try:
-        if "consent" in driver.current_url:
-            logger.info("🍪 Принимаю куки (GDPR)...")
-            try:
-                accept_btn = WebDriverWait(driver, 5).until(
-                    EC.element_to_be_clickable((By.XPATH, "//button[contains(@name, 'agree') or contains(@value, 'agree') or contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'agree')]"))
-                )
-                accept_btn.click()
-                time.sleep(3) 
-            except Exception as e:
-                logger.warning(f"Ошибка кнопки куки: {e}")
-    except Exception as e:
-        logger.warning(f"Ошибка куки: {e}")
-
-# ================= ПАРСИНГ =================
 def get_latest_news(only_fresh=True):
-    driver = None
     links = [] 
     seen_urls = set()
+    
+    # Список URL для сканирования (основной + запасной)
+    urls_to_scan = [TARGET_URL]
+    session = get_session()
 
-    try:
-        logger.info(f"🌐 Сканирую: {TARGET_URL}")
-        driver = get_driver()
-        driver.get(TARGET_URL)
-        handle_consent_popup(driver)
-        time.sleep(5)
-        
+    for current_url in urls_to_scan:
+        if len(links) > 0: break # Если нашли ссылки, выходим
+
+        if current_url != urls_to_scan[0]: time.sleep(2)
         try:
-            container = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "section.mainContainer"))
-            )
-            logger.info("✅ Секция 'mainContainer' найдена!")
-            elements = container.find_elements(By.TAG_NAME, "a")
-            
-        except Exception as e:
-            logger.error(f"❌ Не нашел секцию mainContainer: {e}")
-            return []
+            logger.info(f"🌐 Сканирую: {current_url}")
+            response = session.get(current_url, timeout=15)
+        
+            if response.status_code != 200:
+                logger.error(f"❌ Ошибка доступа к сайту: {response.status_code}")
+                continue
 
-        for el in elements:
-            try:
-                url = el.get_attribute("href")
-                if not url: continue
-                if url in seen_urls: continue
-                seen_urls.add(url)
+            soup = BeautifulSoup(response.content, 'lxml')
+            if soup.title:
+                title_text = soup.title.string.strip()
+                logger.info(f"📄 Заголовок: {title_text}")
                 
-                if any(x in url for x in ['/video/', '/quote/', 'click.yahoo.com', 'beap.gemini.yahoo.com']):
+                if any(x in title_text for x in ["Consent", "Datenschutzeinstellungen", "Privacy"]):
+                    logger.warning("⚠ Попали на страницу согласия. Пробую следующий URL...")
                     continue
-                
-                if "/news/" in url or "/m/" in url or "/finance/" in url:
-                    if len(url) < 50: continue
-                    links.append(url)
-
-            except: continue
         
-        top_20 = links[:20]
+            # Yahoo Finance часто меняет верстку, ищем универсальный контейнер
+            container = soup.select_one("#Fin-Stream") or \
+                        soup.select_one("#mrt-node-Col1-1-Stream") or \
+                        soup.select_one("div[id*='Stream']") or \
+                        soup.select_one("section.mainContainer") or \
+                        soup.select_one("#quoteNewsStream-0-Stream")
         
-        if only_fresh:
-            fresh_links = [link for link in top_20 if not is_posted(link)]
-            final_list = fresh_links[::-1]
-            
-            if final_list:
-                logger.info(f"🔎 Готово к постингу: {len(final_list)} шт.")
+            if not container:
+                # logger.warning("⚠ Контейнер не найден. Пробую искать через заголовки h3...")
+                elements = soup.select("h3 a")
+                if not elements:
+                    # logger.warning("⚠ Заголовки не найдены. Сканирую ВСЕ ссылки на странице...")
+                    elements = soup.find_all("a")
             else:
-                logger.warning("📭 Новых ссылок нет.")
-            return final_list
-        else:
-            return top_20
+                elements = container.find_all("a")
 
-    except Exception as e:
-        logger.error(f"Selenium Error: {e}")
-        return []
-    finally:
-        if driver: 
-            try: driver.quit()
-            except: pass
+            if not elements:
+                logger.warning(f"⚠ Ссылки не найдены на {current_url}")
+                continue
+
+            for el in elements:
+                try:
+                    url = el.get('href')
+                    if not url: continue
+                
+                    if url.startswith('/'):
+                        url = "https://finance.yahoo.com" + url
+                    url = url.split('?')[0]
+
+                    if url in seen_urls: continue
+                    seen_urls.add(url)
+                
+                    if any(x in url for x in ['/video/', '/quote/', 'click.yahoo.com', 'beap.gemini.yahoo.com', 'subscription']):
+                        continue
+                
+                    if "/news/" in url or "/m/" in url or "/finance/" in url:
+                        if len(url) < 40: continue 
+                        links.append(url)
+
+                except: continue
+
+        except Exception as e:
+            logger.error(f"Parsing Error on {current_url}: {e}")
+            continue
+    
+    # Обработка результатов
+    top_20 = links[:20]
+    
+    if only_fresh:
+        fresh_links = [link for link in top_20 if not is_posted(link)]
+        final_list = fresh_links[::-1]
+        
+        if final_list:
+            logger.info(f"🔎 Готово к постингу: {len(final_list)} шт.")
+        else:
+            logger.warning("📭 Новых ссылок нет.")
+        return final_list
+    else:
+        return top_20
 
 def get_page_text(url):
-    driver = None
     try:
         logger.info(f"📖 Читаю: {url}")
-        driver = get_driver()
-        driver.get(url)
-        handle_consent_popup(driver)
-        try:
-            WebDriverWait(driver, 8).until(EC.presence_of_element_located((By.CLASS_NAME, "caas-body")))
-            return driver.find_element(By.CLASS_NAME, "caas-body").text
-        except:
-            return driver.find_element(By.TAG_NAME, "article").text
+        session = get_session()
+        response = session.get(url, timeout=15)
+        
+        if response.status_code != 200:
+            logger.error(f"Не удалось открыть статью: {response.status_code}")
+            return None
+
+        soup = BeautifulSoup(response.content, 'lxml')
+        
+        if soup.title and soup.title.string:
+            logger.info(f"📄 Заголовок статьи: {soup.title.string.strip()}")
+        
+        # Класс тела статьи на Yahoo Finance обычно .caas-body
+        article_body = soup.select_one(".caas-body")
+        
+        # CoinTelegraph
+        if not article_body:
+            article_body = soup.select_one(".post-content")
+
+        if not article_body:
+            # Запасной вариант - искать тег article
+            article_body = soup.find("article")
+
+        if article_body:
+            # Удаляем "Read more" кнопки и рекламу внутри текста
+            for bad_tag in article_body.select("button, .caas-readmore, .caas-iframe, div[class*='ad-']"):
+                bad_tag.decompose()
+            
+            text = article_body.get_text(separator="\n\n").strip()
+            return text
+        else:
+            logger.warning("⚠ Не удалось найти текст статьи (нет .caas-body)")
+            return None
+
     except Exception as e:
         logger.error(f"Текст не получен: {e}")
         return None
-    finally:
-        if driver: 
-            try: driver.quit()
-            except: pass
 
 # ================= AI =================
 def process_content_dynamic(text):
@@ -252,7 +280,7 @@ def process_content_dynamic(text):
             prompt = parts[1].strip()
         else:
             raw_post = full_response
-            prompt = "Bitcoin crypto finance"
+            prompt = "Bitcoin crypto finance abstract"
             
         clean_post = clean_html_for_telegram(raw_post)
         return clean_post, prompt
@@ -261,22 +289,15 @@ def process_content_dynamic(text):
         logger.error(f"AI Error: {e}")
         return None, ""
 
-# ================= РАБОТА С КАРТИНКАМИ (НОВОЕ) =================
-# ================= РАБОТА С КАРТИНКАМИ (ОБНОВЛЕНО) =================
+# ================= РАБОТА С КАРТИНКАМИ =================
 def download_and_validate_image(prompt):
-    """
-    Генерирует ссылку, скачивает картинку для ПРОВЕРКИ, 
-    но возвращает URL, чтобы отправить его через sendMessage.
-    """
     base_seed = int(time.time())
     encoded_prompt = urllib.parse.quote(prompt)
-    # Используем Flux модель, nologo=true
     url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1280&height=720&seed={base_seed}&nologo=true&model=flux"
     
     logger.info(f"🎨 Генерирую и проверяю картинку: {prompt[:50]}...")
     
     try:
-        # Скачиваем с таймаутом ТОЛЬКО для проверки
         response = requests.get(url, timeout=60)
         
         if response.status_code != 200:
@@ -284,33 +305,36 @@ def download_and_validate_image(prompt):
             return None
 
         image_data = response.content
-        image_size = len(image_data)
         image_md5 = hashlib.md5(image_data).hexdigest()
 
-        # 1. ПРОВЕРКА РАЗМЕРА
-        if image_size < 60000: 
-            logger.warning(f"⛔ Картинка слишком легкая ({image_size} байт). Скорее всего заглушка. Отменяю.")
-            return None
-
-        # 2. ПРОВЕРКА ХЭША (ЧЕРНЫЙ СПИСОК)
         if image_md5 in BLOCKED_IMAGE_HASHES:
-            logger.warning(f"⛔ Картинка в черном списке (Hash: {image_md5}). Не отправляю.")
-            return None
+            logger.warning(f"⛔ Картинка в черном списке. Не отправляю.")
+            return "BLOCKED"
 
-        logger.info(f"✅ Картинка валидна (Size: {image_size}). Возвращаю URL.")
-        # ВОЗВРАЩАЕМ URL, а не байты
+        logger.info(f"✅ Картинка валидна. Возвращаю URL.")
         return url
 
     except Exception as e:
         logger.error(f"Ошибка проверки картинки: {e}")
         return None
 
+def notify_admin(message):
+    """Отправляет уведомление администратору в Telegram"""
+    if not TELEGRAM_ADMIN_ID or not TELEGRAM_BOT_TOKEN:
+        return
+
+    try:
+        api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        data = {
+            'chat_id': TELEGRAM_ADMIN_ID,
+            'text': f"⚠️ <b>Уведомление от бота:</b>\n\n{str(message)[:4000]}",
+            'parse_mode': 'HTML'
+        }
+        requests.post(api_url, data=data)
+    except Exception as e:
+        logger.error(f"Не удалось отправить уведомление админу: {e}")
+
 def send_telegram_post(text, image_url):
-    """
-    Отправляет пост через sendMessage.
-    Если есть image_url, вставляет его как невидимую ссылку для превью.
-    Это позволяет отправлять до 4096 символов текста.
-    """
     chat_id = TELEGRAM_ADMIN_ID if TEST_MODE else TELEGRAM_CHANNEL_ID
     dest = "АДМИНУ" if TEST_MODE else "В КАНАЛ"
 
@@ -319,15 +343,12 @@ def send_telegram_post(text, image_url):
         return
 
     try:
-        # Формируем тело сообщения
         if image_url:
-            # Вставляем невидимый символ &#8205; внутри ссылки. 
-            # Телеграм распарсит это как превью картинки (Large Media Preview).
             final_text = f'<a href="{image_url}">&#8205;</a>{text}'
-            disable_preview = False # Нужно включить превью, чтобы картинка появилась
+            disable_preview = False 
         else:
             final_text = text
-            disable_preview = True # Если картинки нет, отключаем превью (чтобы не тянулись ссылки из новостей)
+            disable_preview = True 
 
         data = {
             'chat_id': chat_id, 
@@ -339,10 +360,8 @@ def send_telegram_post(text, image_url):
         api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         r = requests.post(api_url, data=data)
 
-        # Обработка ошибок (например, если HTML кривой)
         if r.status_code == 400:
-            logger.warning(f"⚠ Ошибка Telegram 400: {r.text}. Пробую без HTML (но тогда и без картинки)...")
-            # Если ошибка в тегах, отправляем чистый текст без картинки
+            logger.warning(f"⚠ Ошибка Telegram 400: {r.text}. Пробую без HTML...")
             clean_text_only = re.sub(r'<[^>]+>', '', text)
             data['text'] = clean_text_only
             data['parse_mode'] = None
@@ -358,11 +377,10 @@ def send_telegram_post(text, image_url):
         logger.error(f"Send Error: {e}")
 
 # ================= MAIN =================
-# ================= MAIN =================
 if __name__ == "__main__":
     init_db()
     
-    # --- ПЕРВИЧНАЯ СИНХРОНИЗАЦИЯ (ДЛЯ НОВОГО СЕРВЕРА) ---
+    # --- ПЕРВИЧНАЯ СИНХРОНИЗАЦИЯ ---
     try:
         conn = sqlite3.connect('posted_news.db')
         cursor = conn.cursor()
@@ -379,8 +397,9 @@ if __name__ == "__main__":
                 for link in all_links:
                     mark_as_posted(link)
                 
-                links_to_release = all_links[:5] # 5 самых свежих
-                logger.info(f"🔓 Освобождаю {len(links_to_release)} последних новостей для постинга...")
+                # Оставляем пару новостей для теста/старта
+                links_to_release = all_links[:3] 
+                logger.info(f"🔓 Освобождаю {len(links_to_release)} последних новостей...")
                 
                 conn = sqlite3.connect('posted_news.db')
                 for link in links_to_release:
@@ -392,7 +411,8 @@ if __name__ == "__main__":
         logger.error(f"Ошибка инициализации: {e}")
 
     mode_str = "🛠 ТЕСТОВЫЙ" if TEST_MODE else "📢 ПРОДАКШН"
-    logger.info(f"🚀 Бот запущен. Режим: {mode_str}")
+    logger.info(f"🚀 Бот запущен (Requests Mode). Режим: {mode_str}")
+    notify_admin(f"🚀 Бот успешно запущен.\nРежим: {mode_str}")
     
     while True:
         try:
@@ -412,31 +432,35 @@ if __name__ == "__main__":
                 if text and len(text) > 300:
                     post, prompt_text = process_content_dynamic(text)
                     if post:
-                        # 1. Проверяем картинку и получаем URL
                         image_url = download_and_validate_image(prompt_text)
                         
-                        # 2. Если URL вернулся (проверка пройдена), отправляем с ссылкой
-                        # Если None - отправится просто текст
+                        if image_url == "BLOCKED":
+                            logger.info("⏳ Картинка в черном списке. Откладываю пост на следующую попытку...")
+                            continue
+
                         if image_url is None:
-                            logger.info("ℹ Отправляю пост БЕЗ картинки (сбой генерации или фильтр).")
+                            logger.info("ℹ Отправляю пост БЕЗ картинки.")
                         
-                        # 3. Отправляем в телеграм
                         send_telegram_post(post, image_url)
                         
                         mark_as_posted(link)
-                        logger.info(f"💤 Сплю {DELAY_BETWEEN_POSTS} сек...")
-                        time.sleep(DELAY_BETWEEN_POSTS)
+                        wait_time = DELAY_BETWEEN_POSTS + random.randint(10, 60)
+                        logger.info(f"💤 Сплю {wait_time} сек...")
+                        time.sleep(wait_time)
                     else:
                         mark_as_posted(link)
                 else:
-                    logger.warning("Текст слишком короткий.")
+                    logger.warning("Текст слишком короткий или не найден.")
                     mark_as_posted(link)
             
-            logger.info("⏳ Жду 10 мин перед следующей проверкой...")
-            time.sleep(600)
+            wait_time = 600 + random.randint(-120, 120)
+            logger.info(f"⏳ Жду {wait_time // 60} мин ({wait_time} сек) перед следующей проверкой...")
+            time.sleep(wait_time)
             
         except KeyboardInterrupt:
             break
         except Exception as e:
-            logger.critical(f"Global Error: {e}")
+            error_msg = f"❌ Критическая ошибка:\n{e}"
+            logger.critical(error_msg)
+            notify_admin(error_msg)
             time.sleep(60)
