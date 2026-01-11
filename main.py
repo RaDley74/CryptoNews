@@ -291,32 +291,39 @@ def process_content_dynamic(text):
 
 # ================= РАБОТА С КАРТИНКАМИ =================
 def download_and_validate_image(prompt):
-    base_seed = int(time.time())
     encoded_prompt = urllib.parse.quote(prompt)
-    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1280&height=720&seed={base_seed}&nologo=true&model=flux"
     
-    logger.info(f"🎨 Генерирую и проверяю картинку: {prompt[:50]}...")
-    
-    try:
-        response = requests.get(url, timeout=60)
-        
-        if response.status_code != 200:
+    for attempt in range(3):
+        try:
+            base_seed = int(time.time()) + (attempt * 50)
+            url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1280&height=720&seed={base_seed}&nologo=true&model=flux"
+            
+            if attempt == 0:
+                logger.info(f"🎨 Генерирую и проверяю картинку: {prompt[:50]}...")
+            else:
+                logger.info(f"🔄 Попытка {attempt + 1}/3 генерации картинки...")
+
+            response = requests.get(url, timeout=60)
+            
+            if response.status_code == 200:
+                image_data = response.content
+                image_md5 = hashlib.md5(image_data).hexdigest()
+
+                if image_md5 in BLOCKED_IMAGE_HASHES:
+                    logger.warning(f"⛔ Картинка в черном списке. Не отправляю.")
+                    return "BLOCKED"
+
+                logger.info(f"✅ Картинка валидна. Возвращаю URL.")
+                return url
+            
             logger.warning(f"⚠ API картинки вернул код {response.status_code}")
-            return None
+            time.sleep(2)
 
-        image_data = response.content
-        image_md5 = hashlib.md5(image_data).hexdigest()
-
-        if image_md5 in BLOCKED_IMAGE_HASHES:
-            logger.warning(f"⛔ Картинка в черном списке. Не отправляю.")
-            return "BLOCKED"
-
-        logger.info(f"✅ Картинка валидна. Возвращаю URL.")
-        return url
-
-    except Exception as e:
-        logger.error(f"Ошибка проверки картинки: {e}")
-        return None
+        except Exception as e:
+            logger.error(f"Ошибка проверки картинки: {e}")
+            time.sleep(2)
+            
+    return None
 
 def notify_admin(message):
     """Отправляет уведомление администратору в Telegram"""
