@@ -14,6 +14,7 @@ import os
 import random
 from datetime import datetime
 from dotenv import load_dotenv
+from prompts import SYSTEM_PROMPT
 
 # --- SELENIUM IMPORTS ---
 from selenium import webdriver
@@ -272,30 +273,11 @@ def process_content_dynamic(text):
     if not text: return None, []
     logger.info(f"🧠 AI пишет пост...")
     
-    system_prompt = """
-    Ты — редактор крипто-канала.
-    Задача:
-    1. Напиши пост на русском языке.
-    2. Придумай промпт для картинки (English).
-    
-    ВАЖНО ПО ФОРМАТИРОВАНИЮ:
-    - ЗАПРЕЩЕНО использовать теги <p>, <div>.
-    - Используй только <b>Жирный</b>, <i>Курсив</i> и переносы строк.
-    
-    СТРУКТУРА:
-    <b>ЗАГОЛОВОК</b>
-    
-    Текст новости.
-    
-    |||
-    PROMPT_FOR_IMAGE
-    """
-    
     user_message = f"Текст новости:\n{text[:6000]}" 
 
     try:
         chat_completion = client.chat.completions.create(
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_message}],
+            messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_message}],
             model=MODEL_NAME, temperature=0.6, max_tokens=2000,
         )
         full_response = chat_completion.choices[0].message.content
