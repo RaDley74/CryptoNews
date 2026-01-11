@@ -12,6 +12,7 @@ import logging
 import re
 import os
 import random
+import hashlib
 from datetime import datetime
 from dotenv import load_dotenv
 from prompts import SYSTEM_PROMPT
@@ -53,6 +54,13 @@ TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID")
 
 TARGET_URL = "https://finance.yahoo.com/topic/crypto/"
 MODEL_NAME = os.getenv("MODEL_NAME", "llama-3.3-70b-versatile")
+
+# === ЧЕРНЫЙ СПИСОК КАРТИНОК ===
+# Если бот снова пришлет ошибку, скопируй MD5 хэш из логов и добавь сюда.
+BLOCKED_IMAGE_HASHES = [
+    "d41d8cd98f00b204e9800998ecf8427e", # Пустой файл
+    # Сюда можно добавлять хэши заглушек "We Have Moved" если они пролезут через проверку размера
+]
 
 # ================= ЛОГИРОВАНИЕ =================
 logging.basicConfig(
@@ -108,26 +116,6 @@ def clean_html_for_telegram(text):
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
-def parse_time_minutes(text):
-    """Преобразует строку времени (5 minutes ago) в число минут."""
-    if not text: return 999999
-    text = text.lower()
-    
-    # Регулярки для поиска времени
-    # Ищем "5 minutes ago", "1 hour ago"
-    match = re.search(r'(\d+)\s+(minute|hour|day)', text)
-    if match:
-        val = int(match.group(1))
-        unit = match.group(2)
-        if 'minute' in unit: return val
-        if 'hour' in unit: return val * 60
-        if 'day' in unit: return val * 1440
-    
-    if 'yesterday' in text: return 1440
-    if 'just now' in text: return 0
-    
-    return 999999 # Если время не нашли, считаем очень старым
-
 # ================= SELENIUM =================
 def get_driver():
     chrome_options = Options()
@@ -148,7 +136,7 @@ def handle_consent_popup(driver):
             logger.info("🍪 Принимаю куки (GDPR)...")
             try:
                 accept_btn = WebDriverWait(driver, 5).until(
-                    EC.element_to_be_clickable((By.XPATH, "//button[contains(@name, 'agree') or contains(@value, 'agree') or contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'agree') or contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept') or contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'zustimmen')]"))
+                    EC.element_to_be_clickable((By.XPATH, "//button[contains(@name, 'agree') or contains(@value, 'agree') or contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'agree')]"))
                 )
                 accept_btn.click()
                 time.sleep(3) 
@@ -157,8 +145,7 @@ def handle_consent_popup(driver):
     except Exception as e:
         logger.warning(f"Ошибка куки: {e}")
 
-
-# ================= ПАРСИНГ (ТОЛЬКО MAIN CONTAINER) =================
+# ================= ПАРСИНГ =================
 def get_latest_news():
     driver = None
     links = [] 
@@ -171,72 +158,41 @@ def get_latest_news():
         handle_consent_popup(driver)
         time.sleep(5)
         
-        # Прокручиваем, чтобы подгрузить новости в контейнере
-        # driver.execute_script("window.scrollTo(0, 1000);")
-        time.sleep(2)
-        
         try:
-            # --- ГЛАВНОЕ ИЗМЕНЕНИЕ ---
-            # Ищем конкретную секцию по классу mainContainer
-            # Используем CSS селектор, так как он надежнее для составных классов
             container = WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "section.mainContainer"))
             )
             logger.info("✅ Секция 'mainContainer' найдена!")
-            
-            # Ищем ссылки ТОЛЬКО внутри этого контейнера
             elements = container.find_elements(By.TAG_NAME, "a")
-            logger.info(f"⚡ Ссылок внутри контейнера: {len(elements)}")
             
         except Exception as e:
-            logger.error(f"❌ Не нашел секцию mainContainer. Возможно, Yahoo сменил верстку. Ошибка: {e}")
+            logger.error(f"❌ Не нашел секцию mainContainer: {e}")
             return []
 
         for el in elements:
             try:
                 url = el.get_attribute("href")
                 if not url: continue
-                
-                # 1. Дубли
                 if url in seen_urls: continue
                 seen_urls.add(url)
                 
-                # 2. Фильтр мусора (реклама иногда бывает и внутри контейнера)
-                # Игнорируем видео, котировки и т.д.
                 if any(x in url for x in ['/video/', '/quote/', 'click.yahoo.com', 'beap.gemini.yahoo.com']):
                     continue
                 
-                # 3. Это должна быть новость
                 if "/news/" in url or "/m/" in url or "/finance/" in url:
-                    
-                    # Фильтр коротких ссылок
                     if len(url) < 50: continue
-
-                    # 4. Проверка БД
-                    if is_posted(url): continue
-                    
                     links.append(url)
-                    logger.info(f"✅ НАЙДЕНА: {url}")
 
             except: continue
         
-        # СОРТИРОВКА
-        # В ленте Yahoo новости идут сверху вниз: [0] = Самая новая, [End] = Старая.
-        # Мы хотим постить в хронологическом порядке (Старая -> Новая).
-        
-        # 1. Берем 20 самых верхних (это самые свежие на данный момент)
         top_20 = links[:20]
-        
-        # 2. Переворачиваем их. 
-        # Теперь список идет от "Самой старой из свежих" к "Самой свежей"
-        final_list = top_20[::-1]
+        fresh_links = [link for link in top_20 if not is_posted(link)]
+        final_list = fresh_links[::-1]
         
         if final_list:
-            logger.info(f"🔎 Готово к постингу: {len(final_list)} шт. Порядок публикации:")
-            for i, link in enumerate(final_list, 1):
-                logger.info(f"{i}. {link}")
+            logger.info(f"🔎 Готово к постингу: {len(final_list)} шт.")
         else:
-            logger.warning("📭 Новых ссылок в контейнере не найдено (или все уже в базе).")
+            logger.warning("📭 Новых ссылок нет.")
 
         return final_list
 
@@ -274,10 +230,15 @@ def process_content_dynamic(text):
     logger.info(f"🧠 AI пишет пост...")
     
     user_message = f"Текст новости:\n{text[:6000]}" 
+    length_instruction = (
+        "ДОПОЛНИТЕЛЬНО: Оцени важность новости. "
+        "Если это ВАЖНОЕ событие — напиши развернуто (3-4 абзаца). "
+        "Если рядовое — 2-3 абзаца. Не делай пост короче 2-х абзацев."
+    )
 
     try:
         chat_completion = client.chat.completions.create(
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_message}],
+            messages=[{"role": "system", "content": f"{SYSTEM_PROMPT}\n\n{length_instruction}"}, {"role": "user", "content": user_message}],
             model=MODEL_NAME, temperature=0.6, max_tokens=2000,
         )
         full_response = chat_completion.choices[0].message.content
@@ -291,24 +252,60 @@ def process_content_dynamic(text):
             prompt = "Bitcoin crypto finance"
             
         clean_post = clean_html_for_telegram(raw_post)
-        return clean_post, [prompt]
+        return clean_post, prompt
         
     except Exception as e:
         logger.error(f"AI Error: {e}")
-        return None, []
+        return None, ""
 
-# ================= ОТПРАВКА =================
-def generate_image_urls(prompts):
-    urls = []
+# ================= РАБОТА С КАРТИНКАМИ (НОВОЕ) =================
+def download_and_validate_image(prompt):
+    """
+    Генерирует ссылку, скачивает картинку, проверяет её на ошибки.
+    Возвращает байты картинки или None.
+    """
     base_seed = int(time.time())
-    prompt = urllib.parse.quote(prompts[0])
-    url = f"https://image.pollinations.ai/prompt/{prompt}?width=1280&height=720&seed={base_seed}&nologo=true&model=flux"
-    urls.append(url)
-    return urls
-
-def send_telegram(text, image_urls):
-    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    encoded_prompt = urllib.parse.quote(prompt)
+    # Используем Flux модель, nologo=true
+    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1280&height=720&seed={base_seed}&nologo=true&model=flux"
     
+    logger.info(f"🎨 Генерирую картинку: {prompt[:50]}...")
+    
+    try:
+        # Скачиваем с таймаутом
+        response = requests.get(url, timeout=60)
+        
+        if response.status_code != 200:
+            logger.warning(f"⚠ API картинки вернул код {response.status_code}")
+            return None
+
+        image_data = response.content
+        image_size = len(image_data)
+        image_md5 = hashlib.md5(image_data).hexdigest()
+
+        # 1. ПРОВЕРКА РАЗМЕРА
+        # Заглушки обычно маленькие (меньше 60КБ). Нормальные Flux картинки весят 100-500КБ.
+        if image_size < 60000: 
+            logger.warning(f"⛔ Картинка слишком легкая ({image_size} байт). Скорее всего это заглушка 'Limit Reached'. Отменяю картинку.")
+            logger.info(f"MD5 этой плохой картинки: {image_md5}")
+            return None
+
+        # 2. ПРОВЕРКА ХЭША (ЧЕРНЫЙ СПИСОК)
+        if image_md5 in BLOCKED_IMAGE_HASHES:
+            logger.warning(f"⛔ Картинка в черном списке (Hash: {image_md5}). Не отправляю.")
+            return None
+
+        logger.info(f"✅ Картинка валидна (Size: {image_size}, Hash: {image_md5})")
+        return image_data
+
+    except Exception as e:
+        logger.error(f"Ошибка загрузки картинки: {e}")
+        return None
+
+def send_telegram_post(text, image_data):
+    """
+    Отправляет пост. Если есть image_data -> sendPhoto, иначе -> sendMessage.
+    """
     chat_id = TELEGRAM_ADMIN_ID if TEST_MODE else TELEGRAM_CHANNEL_ID
     dest = "АДМИНУ" if TEST_MODE else "В КАНАЛ"
 
@@ -316,18 +313,68 @@ def send_telegram(text, image_urls):
         logger.error("❌ Не указан CHAT_ID")
         return
 
-    final_text = f'<a href="{image_urls[0]}">&#8205;</a>{text}' if image_urls else text
-    data = {'chat_id': chat_id, 'text': final_text, 'parse_mode': 'HTML', 'disable_web_page_preview': False}
-
     try:
-        r = requests.post(api_url, data=data)
-        if r.status_code == 400:
-            logger.warning(f"⚠ Ошибка HTML. Шлю без тегов...")
-            clean_text = text.replace('<b>', '').replace('</b>', '')
-            data['text'] = clean_text + f"\n\n{image_urls[0] if image_urls else ''}"
-            requests.post(api_url, data=data)
-        elif r.status_code == 200: 
-            logger.info(f"✅ Пост отправлен {dest}!")
+        r = None
+        if image_data:
+            # Telegram Caption Limit is 1024 chars.
+            if len(text) > 1000:
+                logger.info("ℹ Текст > 1000 символов. Отправляю картинку и текст отдельно.")
+                
+                # 1. Send Photo
+                files = {'photo': ('image.jpg', image_data, 'image/jpeg')}
+                data_photo = {'chat_id': chat_id}
+                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto", data=data_photo, files=files)
+                
+                # 2. Send Text
+                data = {
+                    'chat_id': chat_id, 
+                    'text': text, 
+                    'parse_mode': 'HTML',
+                    'disable_web_page_preview': True
+                }
+                api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                r = requests.post(api_url, data=data)
+            else:
+                # Отправка ФОТО + Текст (Caption)
+                files = {'photo': ('image.jpg', image_data, 'image/jpeg')}
+                data = {
+                    'chat_id': chat_id, 
+                    'caption': text, 
+                    'parse_mode': 'HTML'
+                }
+                api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+                r = requests.post(api_url, data=data, files=files)
+        else:
+            # Только ТЕКСТ (если картинка не сгенерировалась)
+            data = {
+                'chat_id': chat_id, 
+                'text': text, 
+                'parse_mode': 'HTML',
+                'disable_web_page_preview': True
+            }
+            api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            r = requests.post(api_url, data=data)
+
+        if r and r.status_code == 400:
+            logger.warning(f"⚠ Ошибка Telegram 400: {r.text}. Пробую без HTML...")
+            # Повтор без форматирования если ошибка
+            clean_text = text.replace('<b>', '').replace('</b>', '').replace('<p>', '').replace('</p>', '')
+            
+            if image_data:
+                data['caption'] = clean_text
+                del data['parse_mode']
+                files = {'photo': ('image.jpg', image_data, 'image/jpeg')} 
+                r = requests.post(api_url, data=data, files=files)
+            else:
+                data['text'] = clean_text
+                del data['parse_mode']
+                r = requests.post(api_url, data=data)
+        
+        if r and r.status_code == 200:
+            logger.info(f"✅ Пост успешно отправлен {dest}!")
+        elif r:
+            logger.error(f"Ошибка отправки: {r.text}")
+
     except Exception as e:
         logger.error(f"Send Error: {e}")
 
@@ -343,16 +390,28 @@ if __name__ == "__main__":
             
             if not links:
                 logger.info("📭 Нет новых новостей.")
+            else:
+                logger.info(f"📋 Очередь обработки ({len(links)} шт):")
+                for i, l in enumerate(links, 1):
+                    logger.info(f"   {i}. {l}")
             
             for link in links:
-                logger.info(f"▶ {link}")
+                logger.info(f"▶ Обработка: {link}")
                 text = get_page_text(link)
                 
                 if text and len(text) > 300:
-                    post, prompts = process_content_dynamic(text)
+                    post, prompt_text = process_content_dynamic(text)
                     if post:
-                        img = generate_image_urls(prompts)
-                        send_telegram(post, img)
+                        # 1. Пытаемся получить нормальную картинку
+                        image_bytes = download_and_validate_image(prompt_text)
+                        
+                        # 2. Если картинка "плохая" (None), отправляем только текст
+                        if image_bytes is None:
+                            logger.info("ℹ Отправляю пост БЕЗ картинки (сбой генерации или фильтр).")
+                        
+                        # 3. Отправляем в телеграм
+                        send_telegram_post(post, image_bytes)
+                        
                         mark_as_posted(link)
                         logger.info(f"💤 Сплю {DELAY_BETWEEN_POSTS} сек...")
                         time.sleep(DELAY_BETWEEN_POSTS)
@@ -362,7 +421,7 @@ if __name__ == "__main__":
                     logger.warning("Текст слишком короткий.")
                     mark_as_posted(link)
             
-            logger.info("⏳ Жду 10 мин...")
+            logger.info("⏳ Жду 10 мин перед следующей проверкой...")
             time.sleep(600)
             
         except KeyboardInterrupt:
