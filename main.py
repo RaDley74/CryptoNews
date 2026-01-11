@@ -259,20 +259,21 @@ def process_content_dynamic(text):
         return None, ""
 
 # ================= РАБОТА С КАРТИНКАМИ (НОВОЕ) =================
+# ================= РАБОТА С КАРТИНКАМИ (ОБНОВЛЕНО) =================
 def download_and_validate_image(prompt):
     """
-    Генерирует ссылку, скачивает картинку, проверяет её на ошибки.
-    Возвращает байты картинки или None.
+    Генерирует ссылку, скачивает картинку для ПРОВЕРКИ, 
+    но возвращает URL, чтобы отправить его через sendMessage.
     """
     base_seed = int(time.time())
     encoded_prompt = urllib.parse.quote(prompt)
     # Используем Flux модель, nologo=true
     url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1280&height=720&seed={base_seed}&nologo=true&model=flux"
     
-    logger.info(f"🎨 Генерирую картинку: {prompt[:50]}...")
+    logger.info(f"🎨 Генерирую и проверяю картинку: {prompt[:50]}...")
     
     try:
-        # Скачиваем с таймаутом
+        # Скачиваем с таймаутом ТОЛЬКО для проверки
         response = requests.get(url, timeout=60)
         
         if response.status_code != 200:
@@ -284,10 +285,8 @@ def download_and_validate_image(prompt):
         image_md5 = hashlib.md5(image_data).hexdigest()
 
         # 1. ПРОВЕРКА РАЗМЕРА
-        # Заглушки обычно маленькие (меньше 60КБ). Нормальные Flux картинки весят 100-500КБ.
         if image_size < 60000: 
-            logger.warning(f"⛔ Картинка слишком легкая ({image_size} байт). Скорее всего это заглушка 'Limit Reached'. Отменяю картинку.")
-            logger.info(f"MD5 этой плохой картинки: {image_md5}")
+            logger.warning(f"⛔ Картинка слишком легкая ({image_size} байт). Скорее всего заглушка. Отменяю.")
             return None
 
         # 2. ПРОВЕРКА ХЭША (ЧЕРНЫЙ СПИСОК)
@@ -295,16 +294,19 @@ def download_and_validate_image(prompt):
             logger.warning(f"⛔ Картинка в черном списке (Hash: {image_md5}). Не отправляю.")
             return None
 
-        logger.info(f"✅ Картинка валидна (Size: {image_size}, Hash: {image_md5})")
-        return image_data
+        logger.info(f"✅ Картинка валидна (Size: {image_size}). Возвращаю URL.")
+        # ВОЗВРАЩАЕМ URL, а не байты
+        return url
 
     except Exception as e:
-        logger.error(f"Ошибка загрузки картинки: {e}")
+        logger.error(f"Ошибка проверки картинки: {e}")
         return None
 
-def send_telegram_post(text, image_data):
+def send_telegram_post(text, image_url):
     """
-    Отправляет пост. Если есть image_data -> sendPhoto, иначе -> sendMessage.
+    Отправляет пост через sendMessage.
+    Если есть image_url, вставляет его как невидимую ссылку для превью.
+    Это позволяет отправлять до 4096 символов текста.
     """
     chat_id = TELEGRAM_ADMIN_ID if TEST_MODE else TELEGRAM_CHANNEL_ID
     dest = "АДМИНУ" if TEST_MODE else "В КАНАЛ"
@@ -314,61 +316,35 @@ def send_telegram_post(text, image_data):
         return
 
     try:
-        r = None
-        if image_data:
-            # Telegram Caption Limit is 1024 chars.
-            if len(text) > 1000:
-                logger.info("ℹ Текст > 1000 символов. Отправляю картинку и текст отдельно.")
-                
-                # 1. Send Photo
-                files = {'photo': ('image.jpg', image_data, 'image/jpeg')}
-                data_photo = {'chat_id': chat_id}
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto", data=data_photo, files=files)
-                
-                # 2. Send Text
-                data = {
-                    'chat_id': chat_id, 
-                    'text': text, 
-                    'parse_mode': 'HTML',
-                    'disable_web_page_preview': True
-                }
-                api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-                r = requests.post(api_url, data=data)
-            else:
-                # Отправка ФОТО + Текст (Caption)
-                files = {'photo': ('image.jpg', image_data, 'image/jpeg')}
-                data = {
-                    'chat_id': chat_id, 
-                    'caption': text, 
-                    'parse_mode': 'HTML'
-                }
-                api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-                r = requests.post(api_url, data=data, files=files)
+        # Формируем тело сообщения
+        if image_url:
+            # Вставляем невидимый символ &#8205; внутри ссылки. 
+            # Телеграм распарсит это как превью картинки (Large Media Preview).
+            final_text = f'<a href="{image_url}">&#8205;</a>{text}'
+            disable_preview = False # Нужно включить превью, чтобы картинка появилась
         else:
-            # Только ТЕКСТ (если картинка не сгенерировалась)
-            data = {
-                'chat_id': chat_id, 
-                'text': text, 
-                'parse_mode': 'HTML',
-                'disable_web_page_preview': True
-            }
-            api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            r = requests.post(api_url, data=data)
+            final_text = text
+            disable_preview = True # Если картинки нет, отключаем превью (чтобы не тянулись ссылки из новостей)
 
-        if r and r.status_code == 400:
-            logger.warning(f"⚠ Ошибка Telegram 400: {r.text}. Пробую без HTML...")
-            # Повтор без форматирования если ошибка
-            clean_text = text.replace('<b>', '').replace('</b>', '').replace('<p>', '').replace('</p>', '')
-            
-            if image_data:
-                data['caption'] = clean_text
-                del data['parse_mode']
-                files = {'photo': ('image.jpg', image_data, 'image/jpeg')} 
-                r = requests.post(api_url, data=data, files=files)
-            else:
-                data['text'] = clean_text
-                del data['parse_mode']
-                r = requests.post(api_url, data=data)
+        data = {
+            'chat_id': chat_id, 
+            'text': final_text, 
+            'parse_mode': 'HTML',
+            'disable_web_page_preview': disable_preview
+        }
+        
+        api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        r = requests.post(api_url, data=data)
+
+        # Обработка ошибок (например, если HTML кривой)
+        if r.status_code == 400:
+            logger.warning(f"⚠ Ошибка Telegram 400: {r.text}. Пробую без HTML (но тогда и без картинки)...")
+            # Если ошибка в тегах, отправляем чистый текст без картинки
+            clean_text_only = re.sub(r'<[^>]+>', '', text)
+            data['text'] = clean_text_only
+            data['parse_mode'] = None
+            data['disable_web_page_preview'] = True
+            r = requests.post(api_url, data=data)
         
         if r and r.status_code == 200:
             logger.info(f"✅ Пост успешно отправлен {dest}!")
@@ -378,6 +354,7 @@ def send_telegram_post(text, image_data):
     except Exception as e:
         logger.error(f"Send Error: {e}")
 
+# ================= MAIN =================
 # ================= MAIN =================
 if __name__ == "__main__":
     init_db()
@@ -402,15 +379,16 @@ if __name__ == "__main__":
                 if text and len(text) > 300:
                     post, prompt_text = process_content_dynamic(text)
                     if post:
-                        # 1. Пытаемся получить нормальную картинку
-                        image_bytes = download_and_validate_image(prompt_text)
+                        # 1. Проверяем картинку и получаем URL
+                        image_url = download_and_validate_image(prompt_text)
                         
-                        # 2. Если картинка "плохая" (None), отправляем только текст
-                        if image_bytes is None:
+                        # 2. Если URL вернулся (проверка пройдена), отправляем с ссылкой
+                        # Если None - отправится просто текст
+                        if image_url is None:
                             logger.info("ℹ Отправляю пост БЕЗ картинки (сбой генерации или фильтр).")
                         
                         # 3. Отправляем в телеграм
-                        send_telegram_post(post, image_bytes)
+                        send_telegram_post(post, image_url)
                         
                         mark_as_posted(link)
                         logger.info(f"💤 Сплю {DELAY_BETWEEN_POSTS} сек...")
